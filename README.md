@@ -1,10 +1,24 @@
 # SO-100 PushT — Diffusion Policy with C++ Middleware Inference
 
-A complete imitation-learning pipeline for the **PushT** manipulation task on the **SO-100 robotic arm** in MuJoCo. The key engineering contribution is a **cross-language inference architecture**: Python gymnasium environment ↔ pybind11 ↔ [TinyMiddleware](https://github.com/clowncy/TinyMiddleware) C++ EventLoop/DDS ↔ TensorRT U-Net runner.
+> **Fork & Extension of [boaoqian/pushT-so100](https://github.com/boaoqian/pushT-so100)**
+> The original repo provides the training pipeline and MuJoCo environment. This fork adds a **C++ inference backend** with TensorRT acceleration and a Fast DDS middleware layer, contributed by [@clowncy666](https://github.com/clowncy666).
 
 [中文版](README-ZH.md)
 
 ![Demo](assets/image.png)
+
+---
+
+## My Contributions
+
+The original project trained and inferred entirely in Python. My work focused on **decoupling inference from simulation** and building a production-grade C++ deployment pipeline:
+
+| Work | Description |
+|------|-------------|
+| **Cross-language architecture** | Built pybind11 bindings to bridge the Python gymnasium env with a C++ [TinyMiddleware](https://github.com/clowncy666/TinyMiddleware) node; defined `VisionMsg` / `ActionMsg` DDS message types for zero-copy shared-memory transport |
+| **TensorRT export pipeline** | Wrote `export_all.py` to trace DiffusionPolicy's vision encoder and U-Net denoiser to ONNX, then `build_engine.py` to compile FP16 TRT engines; the full Python → ONNX → TRT chain runs without manual intervention |
+| **Runtime normalization** | Implemented dynamic stats extraction in `infer_trt.py`: reads `min/max` action boundaries directly from the pretrained model config at startup, maps U-Net output `[-1, 1]` to physical workspace coordinates — no hardcoded constants |
+| **Event-driven inference loop** | Replaced polling-based inference with a callback-driven architecture: Python publishes `VisionMsg` via Fast DDS SHM; the C++ EventLoop (epoll reactor + ThreadPool) runs TRT inference and fires an `ActionMsg` callback back to Python — simulation and inference are fully decoupled |
 
 ---
 

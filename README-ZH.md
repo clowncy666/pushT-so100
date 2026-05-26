@@ -1,115 +1,184 @@
-# MuJoCo SO100 PushT：Diffusion Policy 实现
+# SO-100 PushT — 基于 C++ 中间件的 Diffusion Policy 推理架构
 
-本仓库提供了在 **MuJoCo** 物理引擎中使用 **SO100 机械臂** 完成 **PushT 任务** 的完整流程。项目包含与 Gymnasium 兼容的环境、用于数据采集的遥操作接口，以及遵循 **LeRobot 4.4** 生态系统的训练/推理工作流。
+> **Fork 自 [boaoqian/pushT-so100](https://github.com/boaoqian/pushT-so100)**
+> 原仓库提供训练流程与 MuJoCo 仿真环境。本 Fork 在此基础上新增了 **TensorRT 加速的 C++ 推理后端** 与 **Fast DDS 中间件层**，由 [@clowncy666](https://github.com/clowncy666) 完成。
 
-![alt text](assets/image.png)
+![Demo](assets/image.png)
 
-## 📂 项目结构
+---
 
-```bash
-├── chernyadev/               # 资源文件与 MJCF 模型
-│   └── ... /trs_so_arm100    # SO100 场景配置（scene.xml, test_env.xml）
-├── data/                     # 数据集存储
-│   ├── NewData*/             # 处理后的演示数据集
-├── script/                   # 自动化脚本工具
-│   ├── record_demonstration_data.sh # 批量数据采集脚本
-│   ├── infer.sh              # 策略评估脚本
-│   └── train_policy.sh       # 策略训练脚本
-├── src/                      # 核心源代码
-│   ├── env_human_*.py        # 遥操作接口（末端/伺服模式）用于数据采集
-│   ├── env_gym_*.py          # 用于训练/推理的 Gymnasium 封装环境
-│   ├── train.py              # Diffusion Policy 训练流程（基于 LeRobot 4.0）
-│   ├── infer.py              # 模型评估与推理测试
-│   └── helper.py             # 通用工具函数与环境辅助模块
-└── outputs/                  # 训练与评估结果输出
-    ├── ckpt/                 # 模型检查点
-    ├── runs/                 # TensorBoard 日志与训练指标
-    └── recorded_videos/      # 策略评估episode的渲染视频
+## 我的贡献
+
+原项目的训练与推理全部在 Python 侧完成。我的工作聚焦于**将推理与仿真解耦**，并构建面向部署的 C++ 推理流水线：
+
+| 工作内容 | 说明 |
+|----------|------|
+| **跨语言架构** | 通过 pybind11 将 Python gymnasium 环境与 C++ [TinyMiddleware](https://github.com/clowncy666/TinyMiddleware) 节点桥接；定义 `VisionMsg` / `ActionMsg` DDS 消息类型，实现零拷贝共享内存传输 |
+| **TensorRT 导出流水线** | 编写 `export_all.py` 将 DiffusionPolicy 的视觉编码器与 U-Net 去噪器导出为 ONNX，再由 `build_engine.py` 编译为 FP16 TRT 引擎；全链路 Python → ONNX → TRT 无需手动干预 |
+| **运行时归一化** | 在 `infer_trt.py` 中实现动态参数提取：启动时从预训练模型 config 读取动作的 `min/max` 边界，将 U-Net 输出 `[-1, 1]` 映射到物理工作空间坐标，消除硬编码常量依赖 |
+| **事件驱动推理循环** | 将原有轮询式推理替换为回调驱动架构：Python 通过 Fast DDS 共享内存发布 `VisionMsg`；C++ EventLoop（epoll reactor + ThreadPool）执行 TRT 推理后以 `ActionMsg` 回调返回 Python；仿真与推理完全解耦 |
+
+---
+
+## 架构总览
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  Python 侧（本仓库）                                      │
+│                                                          │
+│  env_gym_ee.py ──► infer_trt.py                         │
+│       │                │                                 │
+│       │         tinymiddleware_py.so (pybind11)          │
+│       │                │                                 │
+└───────┼────────────────┼─────────────────────────────────┘
+        │                │ VisionMsg（Fast DDS 共享内存）
+        │         ┌──────▼──────────────────────┐
+        │         │  TinyMiddleware C++ 节点      │
+        │         │  EventLoop（epoll reactor）   │
+        │         │  ThreadPool → TRT U-Net      │
+        │         │  ActionMsg → 回调             │
+        │         └──────────────────────────────┘
+        │
+  MuJoCo env.step(action)
+```
+
+Python 侧将相机帧以 `VisionMsg` 形式通过 Fast DDS 共享内存发布；C++ 节点接收后运行 TensorRT 推理，将 `ActionMsg` 回调返回 Python；Python 回调执行仿真步进——仿真调度与推理调度完全解耦。
+
+---
+
+## 项目结构
+
+```
+├── chernyadev .../trs_so_arm100/   # MuJoCo MJCF 模型（SO-100 机械臂 + T 形块场景）
+├── script/
+│   ├── record_demonstration_data.sh
+│   ├── train_policy.sh
+│   └── infer.sh
+├── src/
+│   ├── env_human_ee.py       # 手柄遥操作数据采集
+│   ├── env_gym_ee.py         # Gymnasium 环境（绝对末端位置动作空间）
+│   ├── env_gym_ee_stable.py  # Gymnasium 环境（归一化 [-1,1] 动作 + 宽容差）
+│   ├── helper.py             # 位姿匹配工具
+│   ├── train.py              # DiffusionPolicy 训练（LeRobot 4.x）
+│   ├── infer.py              # 基于 TinyMiddleware 回调的推理（无归一化）
+│   ├── infer_stable.py       # 推理 + 动态 stats 提取与反归一化
+│   ├── infer_trt.py          # 同上，使用 TRT 引擎（推荐）
+│   ├── export_all.py         # DiffusionPolicy → ONNX 导出
+│   ├── build_engine.py       # ONNX → TensorRT FP16 编译
+│   └── onnx_models/          # 生成的 ONNX / TRT 文件（已 gitignore，大文件）
+├── assets/
+├── environment.yml
+└── README-ZH.md
 ```
 
 ---
 
-## 🚀 工作流程指南
+## 工作流程
 
 ### 1. 环境配置
 
-本项目依赖 `mujoco`、`gymnasium` 和 `lerobot`（v4.4）库。
-
-运行以下命令创建康达环境：
 ```bash
 conda env create -f environment.yml
+conda activate pusht
 ```
 
-### 2. 人类演示数据采集
+依赖：`mujoco`、`gymnasium`、`lerobot>=4.0`、`pybind11`、`tensorrt`（TRT 推理路径需要）。
 
-使用 `src/env_human_ee.py` 通过游戏手柄（如 Xbox/PS5）采集高质量演示数据。该脚本将摇杆输入映射为 MuJoCo 中的**末端执行器（EE）增量位置**。
+### 2. 数据采集
 
-![image-20260314190824852](assets/image-20260314190824852.png)
+使用手柄遥操作机械臂在 MuJoCo 中录制演示数据：
 
 ```bash
 ./script/record_demonstration_data.sh
+# 或直接运行：
+cd src && python env_human_ee.py --repo_id ./data/my_dataset --fps 10
 ```
 
-### 3. 数据处理（LeRobot 4.4）
+手柄映射：左摇杆 → 末端 x/y，LB/A → 高度，右摇杆 → 偏航，X → 重置，B → 开始/停止录制。
 
-采集到的数据会被转换为 **LeRobot 数据集格式**（Zarr/Parquet），以确保与现代模仿学习流程兼容。此过程包括生成 Diffusion Policy 所需的元数据。
+Hugging Face 上有预采集数据集可直接使用：[qian1dqs/so100-pusht](https://huggingface.co/datasets/qian1dqs/so100-pusht)
 
-你可以使用 `lerobot-dataset-viz` 可视化数据集：
+![遥操作界面](assets/image-20260314190824852.png)
 
-```bash
-lerobot-dataset-viz --repo-id <你的数据路径> --episode-index 12
-```
-
-此外，我已将数据集上传至 Hugging Face。如果你不想自行采集数据，可在此下载：[qian1dqs/so100-pusht](https://huggingface.co/datasets/qian1dqs/so100-pusht)
-
-### 4. 策略训练
-
-我们采用基于 CNN 的 **Diffusion Policy** 来学习 PushT 任务的多模态动作分布。
+### 3. 训练
 
 ```bash
 ./script/train_policy.sh
+# 或：
+cd src && python train.py --data-path ./data/my_dataset --training-steps 13000
 ```
 
-> 我在 A100 上训练了 1000 个 epoch。模型也已上传至 [Hugging Face](https://huggingface.co/qian1dqs/so100-pusht-diffusion)。
+使用 LeRobot 的 `DiffusionPolicy`（CNN U-Net 主干，ResNet-18 视觉编码器）。预训练检查点：[qian1dqs/so100-pusht-diffusion](https://huggingface.co/qian1dqs/so100-pusht-diffusion)。
 
 损失曲线：
 
-![image-20260314191742736](assets/image-20260314191742736.png)
+![训练损失](assets/image-20260314191742736.png)
 
-### 5. 评估与推理
-
-运行 `src/infer.py` 加载训练好的检查点，在 MuJoCo 仿真环境中测试策略性能。该脚本提供实时渲染以可视化智能体行为。
+### 4. 导出 ONNX + TensorRT
 
 ```bash
+cd src
+python export_all.py          # → onnx_models/vision_encoder.onnx + noise_unet.onnx
+python build_engine.py        # → onnx_models/vision_encoder.engine + noise_unet.engine
+```
+
+`build_engine.py` 在支持 FP16 的 GPU（RTX 系列）上自动启用半精度。`.engine` 文件与 GPU 架构绑定，已加入 `.gitignore`。
+
+### 5. 推理
+
+**标准模式（无 TRT）：**
+```bash
+cd src && python infer.py
+```
+
+**TRT + 归一化参数（推荐）：**
+```bash
+cd src && python infer_trt.py
+# 或：
 ./script/infer.sh
 ```
 
-以下是两个推理示例：
-![PushT Task Demo1](assets/show1.gif)
-![PushT Task Demo2](assets/show2.gif)
+两个脚本均在后台线程启动 TinyMiddleware 节点，通过 Fast DDS 发布相机帧，等待 C++ 推理进程的动作回调。
+
+推理示例：
+
+![Demo 1](assets/show1.gif)
+![Demo 2](assets/show2.gif)
 
 ---
 
-## 🔧 常见问题排查
+## TinyMiddleware 集成说明
 
-- **MuJoCo 渲染显示问题**：确保系统具备可用的 OpenGL 上下文。在无头服务器上使用时，请在 `mujoco.Renderer` 中设置 `headless=True`。
-- **LeRobot 版本不匹配**：本项目基于 `lerobot==4.4` 测试。其他版本可能需要调整 API 调用。
-- **数据集加载错误**：请确认数据路径中包含必需的 `meta.json` 文件和 Zarr 数据块。
+`.so` 绑定文件（`src/tinymiddleware_py.cpython-310-x86_64-linux-gnu.so`）由 [TinyMiddleware](https://github.com/clowncy666/TinyMiddleware) 的 `src/python_bindings.cpp` 通过 pybind11 编译生成。
 
----
+```python
+import tinymiddleware_py
 
-## 📄 许可证
+node = tinymiddleware_py.Node("so100_mujoco_bridge")
+vision_pub = node.create_vision_publisher("VisionDataTopic")
+node.create_action_subscription("ActionDataTopic", action_callback)
 
-本项目采用 MIT 许可证发布。详情请参见 [LICENSE](LICENSE) 文件。
+threading.Thread(target=node.spin, daemon=True).start()
+```
 
----
+C++ 侧处理：Fast DDS 共享内存传输 → epoll EventLoop → ThreadPool → TRT 推理 → 发布 ActionMsg。Python 侧保持纯回调驱动，无轮询开销。
 
-## 🙏 致谢
-
-- [LeRobot](https://github.com/huggingface/lerobot) 提供的模仿学习框架
-- [Diffusion Policy](https://diffusion-policy.cs.columbia.edu/) 提供的策略架构
-- [MuJoCo](https://mujoco.readthedocs.io/) 提供的物理仿真引擎
+**归一化细节**：`infer_trt.py` 在启动时从预训练 `DiffusionPolicy` config 中提取动作的 `min/max` 统计值，将 U-Net 输出 `[-1, 1]` 映射回物理工作空间坐标，同时将关节状态归一化到模型期望的输入范围——全程无硬编码常量。
 
 ---
 
-> 💡 **提示**：为获得最佳效果，建议采集至少 200 条多样化的演示 episode。在 PushT 这类接触丰富的任务中，数据质量对策略性能影响显著。
+## 常见问题
+
+- **找不到 `.so` 文件**：在目标机器上编译 TinyMiddleware（启用 `python_bindings.cpp`）并将产物复制到此处。
+- **TRT 引擎不兼容**：在目标 GPU 上重新运行 `build_engine.py`；引擎文件不可跨 GPU 架构移植。
+- **无头服务器 MuJoCo 渲染问题**：运行前设置 `MUJOCO_GL=egl`。
+- **LeRobot API 变动**：在 `lerobot==4.4` 下测试通过；其他版本的归一化字段名称可能有差异。
+
+---
+
+## 致谢
+
+- [LeRobot](https://github.com/huggingface/lerobot) — 模仿学习框架
+- [Diffusion Policy](https://diffusion-policy.cs.columbia.edu/) — 策略架构
+- [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) — SO-100 MJCF 模型
+- [TinyMiddleware](https://github.com/clowncy666/TinyMiddleware) — C++ 中间件（EventLoop / Fast DDS / ThreadPool）

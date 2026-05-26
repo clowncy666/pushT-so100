@@ -4,3 +4,12 @@ __pycache__
 data
 outputs
 project.zip
+
+# 安装包
+Miniconda3-*.sh
+
+# 编译产物
+src/tinymiddleware_py*.so
+
+# 模型二进制文件（大文件 / GPU 绑定）
+src/onnx_models/

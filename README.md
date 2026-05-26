@@ -1,114 +1,172 @@
-# MuJoCo SO100 PushT: Diffusion Policy Implementation
+# SO-100 PushT — Diffusion Policy with C++ Middleware Inference
 
-This repository provides a complete pipeline for the **PushT task** using the **SO100 robotic arm** within the **MuJoCo** physics engine. It features a Gymnasium-compatible environment, teleoperation for data collection, and training/inference workflows following the **LeRobot 4.4** ecosystem.
+A complete imitation-learning pipeline for the **PushT** manipulation task on the **SO-100 robotic arm** in MuJoCo. The key engineering contribution is a **cross-language inference architecture**: Python gymnasium environment ↔ pybind11 ↔ [TinyMiddleware](https://github.com/clowncy/TinyMiddleware) C++ EventLoop/DDS ↔ TensorRT U-Net runner.
 
-[中文版md](README-ZH.md)
+[中文版](README-ZH.md)
 
-![alt text](assets/image.png)
+![Demo](assets/image.png)
 
-## 📂 Project Structure
+---
 
-```bash
-├── chernyadev/               # Assets and MJCF models
-│   └── ... /trs_so_arm100    # Specific SO100 scene configurations (scene.xml, test_env.xml)
-├── data/                     # Dataset storage
-│   ├── NewData*/             # Processed demonstration datasets
-├── script/                   # Automation utilities
-│   ├── record_demonstration_data.sh # Script for batch data collection
-│   ├── infer.sh              # Script for policy evaluation
-│   └── train_policy.sh       # Script for training policy
-├── src/                      # Core source code
-│   ├── env_human_*.py        # Teleop interfaces (EE/Servo) for data collection
-│   ├── env_gym_*.py          # Gymnasium wrappers for training/inference
-│   ├── train.py              # Diffusion Policy training pipeline (LeRobot 4.0)
-│   ├── infer.py              # Model evaluation and inference testing
-│   └── helper.py             # Common utilities and environment helpers
-└── outputs/                  # Training and evaluation results
-    ├── ckpt/                 # Model checkpoints
-    ├── runs/                 # TensorBoard logs and training metrics
-    └── recorded_videos/      # Renders of policy evaluation episodes
+## Architecture Overview
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  Python Side (this repo)                                 │
+│                                                          │
+│  env_gym_ee.py ──► infer_trt.py                         │
+│       │                │                                 │
+│       │         tinymiddleware_py.so (pybind11)          │
+│       │                │                                 │
+└───────┼────────────────┼─────────────────────────────────┘
+        │                │ VisionMsg (Fast DDS SHM)
+        │         ┌──────▼──────────────────────┐
+        │         │  TinyMiddleware C++ Node     │
+        │         │  EventLoop (epoll reactor)   │
+        │         │  ThreadPool → TRT U-Net      │
+        │         │  ActionMsg → callback        │
+        │         └──────────────────────────────┘
+        │
+  MuJoCo env.step(action)
+```
+
+The Python side publishes camera frames as `VisionMsg` via Fast DDS shared memory; the C++ node receives them, runs TensorRT inference, and sends back `ActionMsg`. The Python callback receives the action and steps the simulator — decoupling simulation from inference scheduling.
+
+---
+
+## Project Structure
+
+```
+├── chernyadev .../trs_so_arm100/   # MuJoCo MJCF model (SO-100 arm + T-block scene)
+├── script/
+│   ├── record_demonstration_data.sh
+│   ├── train_policy.sh
+│   └── infer.sh
+├── src/
+│   ├── env_human_ee.py       # Joystick teleoperation for data collection
+│   ├── env_gym_ee.py         # Gymnasium env (absolute EE position action)
+│   ├── env_gym_ee_stable.py  # Gymnasium env (normalized [-1,1] action + wider tolerances)
+│   ├── helper.py             # Pose matching utilities
+│   ├── train.py              # DiffusionPolicy training (LeRobot 4.x)
+│   ├── infer.py              # Inference via TinyMiddleware callback (no normalization)
+│   ├── infer_stable.py       # Inference + dynamic stats extraction & denormalization
+│   ├── infer_trt.py          # Same as infer_stable but with TRT engine (recommended)
+│   ├── export_all.py         # Export DiffusionPolicy → ONNX (vision encoder + U-Net)
+│   ├── build_engine.py       # Compile ONNX → TensorRT FP16 engine
+│   └── onnx_models/          # Generated ONNX / TRT files (gitignored, large binaries)
+├── assets/
+├── environment.yml
+└── README.md
 ```
 
 ---
 
-## 🚀 Workflow Guide
+## Workflow
 
 ### 1. Environment Setup
 
-The project relies on `mujoco`, `gymnasium`, and the `lerobot` (v4.4) library. 
+```bash
+conda env create -f environment.yml
+conda activate pusht
+```
 
-Run `conda env create -f environment.yml` to set up the environment.
+Requires: `mujoco`, `gymnasium`, `lerobot>=4.0`, `pybind11`, `tensorrt` (for TRT path).
 
-### 2. Human Demonstration Collection
+### 2. Data Collection
 
-Use `src/env_human_ee.py` to collect high-quality demonstrations via a game controller (e.g., Xbox/PS5). This script maps joystick input to **End-Effector (EE)** delta positions in MuJoCo.
-
-![image-20260314190824852](assets/image-20260314190824852.png)
+Use a gamepad to teleoperate the arm in MuJoCo and record demonstrations:
 
 ```bash
 ./script/record_demonstration_data.sh
+# or directly:
+cd src && python env_human_ee.py --repo_id ./data/my_dataset --fps 10
 ```
 
-### 3. Data Processing (LeRobot 4.4)
+Controls: left stick → EE x/y, LB/A → height, right stick → yaw, X → reset, B → start/stop recording.
 
-The collected data is converted into the **LeRobot dataset format** (Zarr/Parquet), ensuring compatibility with modern imitation learning pipelines. This includes generating the necessary metadata for the Diffusion Policy.
+A pre-collected dataset is available on Hugging Face: [qian1dqs/so100-pusht](https://huggingface.co/datasets/qian1dqs/so100-pusht)
 
-You can use `lerobot-dataset-viz` to visualize your dataset like this:
+![Teleoperation](assets/image-20260314190824852.png)
 
-```bash
-lerobot-dataset-viz --repo-id <your-data-path> --episode-index 12
-```
-
-Additionally, I have uploaded my dataset to Hugging Face. If you prefer not to collect data yourself, you can download it here: [qian1dqs/so100-pusht](https://huggingface.co/datasets/qian1dqs/so100-pusht)
-
-### 4. Policy Training
-
-We utilize the **Diffusion Policy** (CNN-based) to learn the multimodal distribution of the PushT task.
+### 3. Training
 
 ```bash
 ./script/train_policy.sh
+# or:
+cd src && python train.py --data-path ./data/my_dataset --training-steps 13000
 ```
 
-I trained this model on an A100 for 1000 epochs. The model is also available on [Hugging Face](https://huggingface.co/qian1dqs/so100-pusht-diffusion).
+Uses LeRobot's `DiffusionPolicy` (CNN U-Net backbone, ResNet-18 vision encoder). A pretrained checkpoint is at [qian1dqs/so100-pusht-diffusion](https://huggingface.co/qian1dqs/so100-pusht-diffusion).
 
 Loss curve:
 
-![image-20260314191742736](assets/image-20260314191742736.png)
+![Training loss](assets/image-20260314191742736.png)
 
-### 5. Evaluation & Inference
-
-Run `src/infer.py` to load a trained checkpoint and test its performance in the MuJoCo simulation. The script provides real-time rendering to visualize the agent's behavior.
+### 4. Export to ONNX + TensorRT
 
 ```bash
+cd src
+python export_all.py          # → onnx_models/vision_encoder.onnx + noise_unet.onnx
+python build_engine.py        # → onnx_models/vision_encoder.engine + noise_unet.engine
+```
+
+`build_engine.py` enables FP16 automatically if the GPU supports it (RTX series). The `.engine` files are GPU-architecture-specific and are gitignored.
+
+### 5. Inference
+
+**Standard (no TRT):**
+```bash
+cd src && python infer.py
+```
+
+**With TRT + normalization stats (recommended):**
+```bash
+cd src && python infer_trt.py
+# or:
 ./script/infer.sh
 ```
-Here are two examples of inference:
-![PushT Task Demo1](assets/show1.gif)
-![PushT Task Demo2](assets/show2.gif)
+
+Both scripts launch a `TinyMiddleware` node in a background thread, publish camera frames via Fast DDS, and wait for action callbacks from the C++ inference process.
+
+Sample inference:
+
+![Demo 1](assets/show1.gif)
+![Demo 2](assets/show2.gif)
 
 ---
 
-## 🔧 Troubleshooting
+## TinyMiddleware Integration
 
-- **Display issues with MuJoCo rendering**: Ensure you have a working OpenGL context. For headless servers, use `mujoco.Renderer` with `headless=True`.
-- **LeRobot version mismatch**: This project is tested with `lerobot==4.4`. Other versions may require API adjustments.
-- **Dataset loading errors**: Verify that your data path contains the required `meta.json` and Zarr chunks.
+The `.so` binding (`src/tinymiddleware_py.cpython-310-x86_64-linux-gnu.so`) is compiled from [TinyMiddleware](https://github.com/clowncy/TinyMiddleware)'s `src/python_bindings.cpp` using pybind11.
 
----
+```python
+import tinymiddleware_py
 
-## 📄 License
+node = tinymiddleware_py.Node("so100_mujoco_bridge")
+vision_pub = node.create_vision_publisher("VisionDataTopic")
+node.create_action_subscription("ActionDataTopic", action_callback)
 
-This project is released under the MIT License. See [LICENSE](LICENSE) for details.
+threading.Thread(target=node.spin, daemon=True).start()
+```
 
----
+The C++ side handles: Fast DDS SHM transport → epoll EventLoop → ThreadPool → TRT inference → ActionMsg publish. This keeps the Python side purely reactive (callback-driven), avoiding polling overhead.
 
-## 🙏 Acknowledgements
-
-- [LeRobot](https://github.com/huggingface/lerobot) for the imitation learning framework
-- [Diffusion Policy](https://diffusion-policy.cs.columbia.edu/) for the policy architecture
-- [MuJoCo](https://mujoco.readthedocs.io/) for the physics simulation
+**Normalization**: `infer_trt.py` extracts `min/max` stats from the pretrained `DiffusionPolicy` config at runtime, maps U-Net output `[-1, 1]` → physical workspace coordinates, and maps joint states into the normalized range the model expects — without hardcoding any constants.
 
 ---
 
-> 💡 **Tip**: For best results, collect at least 200 diverse demonstration episodes. Data quality significantly impacts policy performance in contact-rich tasks like PushT.
+## Troubleshooting
 
+- **No `.so` file**: Build TinyMiddleware with `python_bindings.cpp` enabled and copy the output here.
+- **TRT engine mismatch**: Re-run `build_engine.py` on the target GPU; engines are not portable across GPU architectures.
+- **MuJoCo rendering on headless server**: Set `MUJOCO_GL=egl` before running.
+- **LeRobot API changes**: Tested with `lerobot==4.4`; normalization_mapping field names may differ in other versions.
+
+---
+
+## Acknowledgements
+
+- [LeRobot](https://github.com/huggingface/lerobot) — imitation learning framework
+- [Diffusion Policy](https://diffusion-policy.cs.columbia.edu/) — policy architecture
+- [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) — SO-100 MJCF model
+- [TinyMiddleware](https://github.com/clowncy/TinyMiddleware) — C++ middleware (EventLoop / Fast DDS / ThreadPool)
